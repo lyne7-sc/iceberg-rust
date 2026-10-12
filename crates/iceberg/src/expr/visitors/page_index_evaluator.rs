@@ -140,6 +140,13 @@ impl<'a> PageIndexEvaluator<'a> {
         let Some(&parquet_column_index) =
             self.iceberg_field_id_to_parquet_column_index.get(&field_id)
         else {
+            if self
+                .snapshot_schema
+                .field_by_id(field_id)
+                .is_some_and(|field| field.initial_default.is_some())
+            {
+                return self.select_all_rows();
+            }
             // if the snapshot's column is not present in the row group,
             // exit early
             return match missing_col_behavior {

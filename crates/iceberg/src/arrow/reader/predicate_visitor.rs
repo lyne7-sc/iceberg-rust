@@ -38,7 +38,7 @@ use crate::arrow::get_arrow_datum;
 use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bound_predicate_visitor::BoundPredicateVisitor;
 use crate::expr::{BoundPredicate, BoundReference};
-use crate::spec::Datum;
+use crate::spec::{Datum, Literal, Type};
 
 /// A visitor to collect field ids from bound predicates.
 pub(super) struct CollectFieldIdVisitor {
@@ -236,6 +236,73 @@ impl PredicateConverter<'_> {
         }
     }
 
+    fn evaluate_missing_column(
+        &self,
+        reference: &BoundReference,
+        null_result: bool,
+        evaluate: impl FnOnce(&ArrayRef) -> Result<BooleanArray>,
+    ) -> Result<Box<PredicateResult>> {
+        let value = match reference.field().initial_default.as_ref() {
+            None => null_result,
+            Some(Literal::Primitive(literal)) => {
+                let Type::Primitive(data_type) = reference.field().field_type.as_ref() else {
+                    return Err(invalid_data!(
+                        "Non-primitive field `{}` cannot be used in row predicates.",
+                        reference.field().name
+                    ));
+                };
+                let default = get_arrow_datum(&Datum::new(data_type.clone(), literal.clone()))?;
+                let array = arrow_array::make_array(default.get().0.to_data());
+                let result = evaluate(&array)?;
+                !result.is_null(0) && result.value(0)
+            }
+            Some(_) => {
+                return Err(invalid_data!(
+                    "Non-primitive initial default for field `{}` cannot be used in row predicates.",
+                    reference.field().name
+                ));
+            }
+        };
+        Ok(Box::new(move |batch| {
+            Ok(constant_bool_array(value, batch.num_rows()))
+        }))
+    }
+
+    fn compare_missing_column(
+        &self,
+        reference: &BoundReference,
+        literal: &Datum,
+        null_result: bool,
+        compare: impl FnOnce(
+            &dyn ArrowDatum,
+            &dyn ArrowDatum,
+        ) -> std::result::Result<BooleanArray, ArrowError>,
+    ) -> Result<Box<PredicateResult>> {
+        self.evaluate_missing_column(reference, null_result, |left| {
+            let literal = get_arrow_datum(literal)?;
+            let literal = try_cast_literal(&literal, left.data_type())?;
+            Ok(compare(left, literal.as_ref())?)
+        })
+    }
+
+    fn evaluate_missing_set(
+        &self,
+        reference: &BoundReference,
+        literals: &FnvHashSet<Datum>,
+        negated: bool,
+    ) -> Result<Box<PredicateResult>> {
+        self.evaluate_missing_column(reference, negated, |left| {
+            for literal in literals {
+                let literal = get_arrow_datum(literal)?;
+                let literal = try_cast_literal(&literal, left.data_type())?;
+                if eq(left, literal.as_ref())?.value(0) {
+                    return Ok(constant_bool_array(!negated, 1));
+                }
+            }
+            Ok(constant_bool_array(negated, 1))
+        })
+    }
+
     /// Build an Arrow predicate that always returns true.
     fn build_always_true(&self) -> Result<Box<PredicateResult>> {
         Ok(Box::new(|batch| {
@@ -363,8 +430,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 is_null(&column)
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_true()
+            self.evaluate_missing_column(reference, true, |column| Ok(is_null(column)?))
         }
     }
 
@@ -379,8 +445,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 is_not_null(&column)
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.evaluate_missing_column(reference, false, |column| Ok(is_not_null(column)?))
         }
     }
 
@@ -395,8 +460,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 compute_is_nan(&column)
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.evaluate_missing_column(reference, false, |column| Ok(compute_is_nan(column)?))
         }
     }
 
@@ -412,8 +476,9 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 not(&is_nan)
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_true()
+            self.evaluate_missing_column(reference, true, |column| {
+                Ok(not(&compute_is_nan(column)?)?)
+            })
         }
     }
 
@@ -432,8 +497,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 lt(&left, literal.as_ref())
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_true()
+            self.compare_missing_column(reference, literal, false, lt)
         }
     }
 
@@ -452,8 +516,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 lt_eq(&left, literal.as_ref())
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_true()
+            self.compare_missing_column(reference, literal, false, lt_eq)
         }
     }
 
@@ -472,8 +535,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 gt(&left, literal.as_ref())
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.compare_missing_column(reference, literal, false, gt)
         }
     }
 
@@ -492,8 +554,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 gt_eq(&left, literal.as_ref())
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.compare_missing_column(reference, literal, false, gt_eq)
         }
     }
 
@@ -512,8 +573,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 eq(&left, literal.as_ref())
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.compare_missing_column(reference, literal, false, eq)
         }
     }
 
@@ -532,8 +592,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 neq(&left, literal.as_ref())
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.compare_missing_column(reference, literal, false, neq)
         }
     }
 
@@ -552,8 +611,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 starts_with(&left, literal.as_ref())
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.compare_missing_column(reference, literal, false, starts_with)
         }
     }
 
@@ -573,8 +631,9 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 not(&starts_with(&left, literal.as_ref())?)
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_true()
+            self.compare_missing_column(reference, literal, true, |left, right| {
+                not(&starts_with(left, right)?)
+            })
         }
     }
 
@@ -603,8 +662,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 Ok(acc)
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
+            self.evaluate_missing_set(reference, literals, false)
         }
     }
 
@@ -632,8 +690,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 Ok(acc)
             }))
         } else {
-            // A missing column, treating it as null.
-            self.build_always_true()
+            self.evaluate_missing_set(reference, literals, true)
         }
     }
 }
@@ -835,5 +892,193 @@ mod tests {
             [true, false, true, true]
         );
         assert!(!result.is_null(2));
+    }
+
+    #[test]
+    fn test_missing_column_defaults() {
+        use crate::spec::{Datum, Literal};
+
+        let reference = Reference::new("v");
+        let cases = [
+            (reference.clone().less_than(Datum::int(6)), true, false),
+            (reference.clone().less_than(Datum::int(5)), false, false),
+            (
+                reference.clone().less_than_or_equal_to(Datum::int(5)),
+                true,
+                false,
+            ),
+            (
+                reference.clone().less_than_or_equal_to(Datum::int(4)),
+                false,
+                false,
+            ),
+            (reference.clone().greater_than(Datum::int(4)), true, false),
+            (reference.clone().greater_than(Datum::int(5)), false, false),
+            (
+                reference.clone().greater_than_or_equal_to(Datum::int(5)),
+                true,
+                false,
+            ),
+            (
+                reference.clone().greater_than_or_equal_to(Datum::int(6)),
+                false,
+                false,
+            ),
+            (reference.clone().equal_to(Datum::int(5)), true, false),
+            (reference.clone().equal_to(Datum::int(6)), false, false),
+            (reference.clone().not_equal_to(Datum::int(6)), true, false),
+            (reference.clone().not_equal_to(Datum::int(5)), false, false),
+            (
+                reference.clone().is_in([Datum::int(4), Datum::int(5)]),
+                true,
+                false,
+            ),
+            (
+                reference.clone().is_in([Datum::int(4), Datum::int(6)]),
+                false,
+                false,
+            ),
+            (
+                reference.clone().is_not_in([Datum::int(4), Datum::int(6)]),
+                true,
+                true,
+            ),
+            (
+                reference.clone().is_not_in([Datum::int(4), Datum::int(5)]),
+                false,
+                true,
+            ),
+            (reference.clone().is_null(), false, true),
+            (reference.clone().is_not_null(), true, false),
+        ];
+        let parquet_type = parse_message_type("message schema { optional int32 id = 1; }").unwrap();
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+        let mut converter = PredicateConverter {
+            parquet_schema: &parquet_schema,
+            column_map: &HashMap::new(),
+            column_indices: &vec![],
+        };
+        let batches = [0, 1, 7].map(|len| {
+            RecordBatch::try_new_with_options(
+                Arc::new(ArrowSchema::empty()),
+                vec![],
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(len)),
+            )
+            .unwrap()
+        });
+        for (data_type, default, cases) in [
+            (
+                PrimitiveType::Int,
+                None,
+                cases
+                    .iter()
+                    .map(|(p, _, expected)| (p.clone(), *expected))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                PrimitiveType::Int,
+                Some(Literal::int(5)),
+                cases
+                    .iter()
+                    .map(|(p, expected, _)| (p.clone(), *expected))
+                    .collect(),
+            ),
+            (PrimitiveType::String, Some(Literal::string("foo")), vec![
+                (reference.clone().starts_with(Datum::string("f")), true),
+                (reference.clone().starts_with(Datum::string("b")), false),
+                (reference.clone().not_starts_with(Datum::string("f")), false),
+                (reference.clone().not_starts_with(Datum::string("b")), true),
+            ]),
+            (PrimitiveType::Float, Some(Literal::float(f32::NAN)), vec![
+                (reference.clone().is_nan(), true),
+                (reference.clone().is_not_nan(), false),
+            ]),
+            (PrimitiveType::Float, Some(Literal::float(1.0f32)), vec![
+                (reference.clone().is_nan(), false),
+                (reference.clone().is_not_nan(), true),
+            ]),
+        ] {
+            let mut field = NestedField::optional(5, "v", Type::Primitive(data_type));
+            field.initial_default = default.clone();
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![field.into()])
+                    .build()
+                    .unwrap(),
+            );
+            for (predicate, expected) in cases {
+                let bound = predicate.bind(schema.clone(), true).unwrap();
+                let mut evaluate = visit(&mut converter, &bound).unwrap();
+                for batch in &batches {
+                    assert_eq!(
+                        evaluate(batch.clone()).unwrap(),
+                        constant_bool_array(expected, batch.num_rows()),
+                        "{predicate}, default={default:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_missing_column_invalid_default() {
+        use crate::spec::{Datum, Literal};
+
+        let parquet_type = parse_message_type("message schema { optional int32 id = 1; }").unwrap();
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+        let column_map = HashMap::new();
+        let column_indices = vec![];
+        let mut converter = PredicateConverter {
+            parquet_schema: &parquet_schema,
+            column_map: &column_map,
+            column_indices: &column_indices,
+        };
+
+        for default in [Literal::string("invalid"), Literal::List(vec![])] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(5, "v", Type::Primitive(PrimitiveType::Int))
+                            .with_initial_default(default)
+                            .into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            for predicate in [
+                Reference::new("v").equal_to(Datum::int(5)),
+                Reference::new("v").is_in([Datum::int(4), Datum::int(5)]),
+                Reference::new("v").is_null(),
+            ] {
+                let bound = predicate.bind(schema.clone(), true).unwrap();
+                assert!(visit(&mut converter, &bound).is_err(), "{predicate}");
+            }
+        }
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(5, "v", Type::Primitive(PrimitiveType::Int))
+                        .with_initial_default(Literal::int(5))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let reference = Reference::new("v").bind(schema, true).unwrap();
+        let literal = Datum::uuid(uuid::Uuid::nil());
+        assert!(
+            converter
+                .compare_missing_column(&reference, &literal, false, arrow_ord::cmp::eq)
+                .is_err()
+        );
+        let literals = [literal].into_iter().collect();
+        for negated in [false, true] {
+            assert!(
+                converter
+                    .evaluate_missing_set(&reference, &literals, negated)
+                    .is_err()
+            );
+        }
     }
 }

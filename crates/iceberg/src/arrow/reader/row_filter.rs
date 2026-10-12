@@ -344,6 +344,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_schema_evolution_row_filter() {
+        use crate::spec::Literal;
+
+        let tmp = TempDir::new().unwrap();
+        let reference = Reference::new("v");
+        let all = &[0, 1, 2][..];
+        let none = &[][..];
+        let cases = [
+            (reference.clone().less_than(Datum::int(6)), [none, all, &[
+                1,
+            ]]),
+            (reference.clone().less_than_or_equal_to(Datum::int(5)), [
+                none,
+                all,
+                &[1],
+            ]),
+            (reference.clone().equal_to(Datum::int(5)), [none, all, &[1]]),
+            (reference.clone().equal_to(Datum::int(9)), [none, none, &[
+                2,
+            ]]),
+            (reference.clone().is_null(), [all, none, &[0]]),
+            (reference.is_not_null(), [none, all, &[1, 2]]),
+        ];
+        for (case_index, (case, initial_default, physical_values)) in [
+            ("missing_null", None, None),
+            ("missing_default", Some(5), None),
+            ("physical_null", Some(5), Some(vec![None, Some(5), Some(9)])),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut field = NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Int))
+                .with_write_default(Literal::int(9));
+            field.initial_default = initial_default.map(Literal::int);
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                        field.into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let arrow_field = |name: &str, id: i32, nullable| {
+                Field::new(name, DataType::Int32, nullable).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    id.to_string(),
+                )]))
+            };
+            let mut fields = vec![arrow_field("id", 1, false)];
+            let mut columns: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![1, 2, 3]))];
+            if let Some(values) = &physical_values {
+                fields.push(arrow_field("v", 2, true));
+                columns.push(Arc::new(Int32Array::from(values.clone())));
+            }
+            let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+            let path = format!("{}/{case}.parquet", tmp.path().display());
+            write_row_groups(&path, batch.schema(), vec![batch], false);
+            let values = physical_values.unwrap_or_else(|| vec![initial_default; 3]);
+            for (predicate, selected_rows) in &cases {
+                let selected = selected_rows[case_index];
+                let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                    .with_batch_size(2)
+                    .with_row_selection_enabled(true)
+                    .build();
+                let task = FileScanTask::builder()
+                    .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+                    .with_start(0)
+                    .with_length(0)
+                    .with_data_file_path(path.clone())
+                    .with_data_file_format(DataFileFormat::Parquet)
+                    .with_schema(schema.clone())
+                    .with_project_field_ids(vec![1, 2])
+                    .with_predicate(Some(predicate.bind(schema.clone(), true).unwrap()))
+                    .with_case_sensitive(true)
+                    .build()
+                    .unwrap();
+                let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+                let batches: Vec<RecordBatch> = reader
+                    .read(tasks)
+                    .unwrap()
+                    .stream()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let result_schema = Arc::new(ArrowSchema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("v", DataType::Int32, true),
+                ]));
+                let normalized: Vec<_> = batches
+                    .iter()
+                    .map(|batch| {
+                        RecordBatch::try_new(
+                            result_schema.clone(),
+                            batch
+                                .columns()
+                                .iter()
+                                .map(|column| arrow_cast::cast(column, &DataType::Int32).unwrap())
+                                .collect(),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let actual =
+                    arrow_select::concat::concat_batches(&result_schema, &normalized).unwrap();
+                let expected_ids: Vec<i32> = selected.iter().map(|&i| i as i32 + 1).collect();
+                let expected_values: Vec<Option<i32>> =
+                    selected.iter().map(|&i| values[i]).collect();
+                let expected = RecordBatch::try_new(result_schema, vec![
+                    Arc::new(Int32Array::from(expected_ids)),
+                    Arc::new(Int32Array::from(expected_values)),
+                ])
+                .unwrap();
+                assert_eq!(actual, expected, "{case}: {predicate}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_kleene_logic_or_behaviour() {
         // a IS NULL OR a = 'foo'
         let predicate = Reference::new("a")
