@@ -607,7 +607,7 @@ impl CachingDeleteFileLoader {
             let mut processor = EqDelColumnProcessor::new(&equality_ids);
             visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
 
-            let mut datum_columns_with_names = processor.finish()?;
+            let mut datum_columns_with_names = processor.finish(schema)?;
             if datum_columns_with_names.is_empty() {
                 continue;
             }
@@ -661,7 +661,7 @@ impl CachingDeleteFileLoader {
 
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
-    collected_columns: Vec<(ArrayRef, String, Type)>,
+    collected_columns: Vec<(ArrayRef, i32, Type)>,
 }
 
 impl<'a> EqDelColumnProcessor<'a> {
@@ -675,6 +675,7 @@ impl<'a> EqDelColumnProcessor<'a> {
     #[allow(clippy::type_complexity)]
     fn finish(
         self,
+        schema: &Schema,
     ) -> Result<
         Vec<(
             Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>>,
@@ -683,7 +684,7 @@ impl<'a> EqDelColumnProcessor<'a> {
     > {
         self.collected_columns
             .into_iter()
-            .map(|(array, field_name, field_type)| {
+            .map(|(array, field_id, field_type)| {
                 let primitive_type = field_type
                     .as_primitive_type()
                     .ok_or_else(|| {
@@ -708,7 +709,10 @@ impl<'a> EqDelColumnProcessor<'a> {
                         .transpose()
                     }));
 
-                Ok((datum_iterator, field_name))
+                let field_name = schema
+                    .name_by_field_id(field_id)
+                    .expect("Visited field must exist in schema");
+                Ok((datum_iterator, field_name.to_string()))
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -725,7 +729,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
         if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
             self.collected_columns.push((
                 partner.clone(),
-                field.name.clone(),
+                field.id,
                 field.field_type.as_ref().clone(),
             ));
         }
@@ -888,9 +892,57 @@ mod tests {
         .await
         .expect("error parsing batch stream");
 
-        let expected = "((((((y IS NULL) OR (y != 1)) OR ((z IS NULL) OR (z != 100))) OR ((a IS NULL) OR (a != \"HELP\"))) OR ((sa IS NULL) OR (sa != 4))) OR ((b IS NULL) OR (b != 62696E6172795F64617461))) AND ((((((y IS NULL) OR (y != 2)) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR ((sa IS NULL) OR (sa != 5))) OR (b IS NOT NULL))".to_string();
+        let expected = "((((((y IS NULL) OR (y != 1)) OR ((z IS NULL) OR (z != 100))) OR ((a IS NULL) OR (a != \"HELP\"))) OR ((s.sa IS NULL) OR (s.sa != 4))) OR ((b IS NULL) OR (b != 62696E6172795F64617461))) AND ((((((y IS NULL) OR (y != 2)) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR ((s.sa IS NULL) OR (s.sa != 5))) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_predicate_nested_field_paths() {
+        use crate::expr::Bind;
+
+        for with_top_level_name_collision in [false, true] {
+            let mut fields = Vec::new();
+            let mut columns: Vec<ArrayRef> = Vec::new();
+            if with_top_level_name_collision {
+                fields.push(simple_field("id", DataType::Int32, false, "1"));
+                columns.push(Arc::new(Int32Array::from(vec![99])));
+            }
+            for (name, struct_id, leaf_id, value) in [("a", "2", "3", 4), ("b", "4", "5", 5)] {
+                let nested = StructArray::from(vec![(
+                    Arc::new(simple_field("id", DataType::Int32, true, leaf_id)),
+                    Arc::new(Int32Array::from(vec![Some(value)])) as ArrayRef,
+                )]);
+                fields.push(simple_field(
+                    name,
+                    nested.data_type().clone(),
+                    false,
+                    struct_id,
+                ));
+                columns.push(Arc::new(nested));
+            }
+            let arrow_schema = Arc::new(arrow_schema::Schema::new(fields));
+            let schema = Arc::new(arrow_schema_to_schema(&arrow_schema).unwrap());
+            let batch = RecordBatch::try_new(arrow_schema, columns).unwrap();
+            let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+            let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+                stream,
+                HashSet::from([3, 5]),
+            )
+            .await
+            .unwrap();
+
+            let expected = Reference::new("a.id")
+                .is_null()
+                .or(Reference::new("a.id").not_equal_to(Datum::int(4)))
+                .or(Reference::new("b.id")
+                    .is_null()
+                    .or(Reference::new("b.id").not_equal_to(Datum::int(5))));
+            assert_eq!(
+                predicate.bind(schema.clone(), true).unwrap(),
+                expected.bind(schema, true).unwrap(),
+            );
+        }
     }
 
     // An equality delete keyed on a nullable column must not delete rows whose value in that
