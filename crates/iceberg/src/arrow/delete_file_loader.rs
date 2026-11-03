@@ -26,7 +26,7 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
-use crate::spec::{Schema, SchemaRef};
+use crate::spec::{Schema, SchemaRef, StructType, prune_columns};
 use crate::{Error, ErrorKind, Result};
 
 /// Delete File Loader
@@ -102,8 +102,27 @@ impl BasicDeleteFileLoader {
         target_schema: Arc<Schema>,
         equality_ids: &[i32],
     ) -> Result<ArrowRecordBatchStream> {
+        for field_id in equality_ids {
+            target_schema
+                .field_by_id(*field_id)
+                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "field not found"))?;
+        }
+        let projected_struct = if equality_ids.is_empty() {
+            StructType::default()
+        } else {
+            prune_columns(&target_schema, equality_ids.iter().copied(), false)?
+                .to_struct_type()
+                .expect("Pruning a schema must produce a struct")
+        };
+        let projected_field_ids: Vec<_> = projected_struct.fields().iter().map(|f| f.id).collect();
+        let projected_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(target_schema.schema_id())
+                .with_fields(projected_struct.fields().iter().cloned())
+                .build()?,
+        );
         let mut record_batch_transformer =
-            RecordBatchTransformerBuilder::new(target_schema.clone(), equality_ids).build();
+            RecordBatchTransformerBuilder::new(projected_schema, &projected_field_ids).build();
 
         let record_batch_stream = record_batch_stream.map(move |record_batch| {
             record_batch.and_then(|record_batch| {
@@ -171,6 +190,17 @@ mod tests {
         let result = result.try_collect::<Vec<_>>().await.unwrap();
 
         assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_evolve_schema_rejects_unknown_equality_id() {
+        let schema = Arc::new(Schema::builder().build().unwrap());
+        let stream: ArrowRecordBatchStream = futures::stream::empty().boxed();
+        let error = BasicDeleteFileLoader::evolve_schema(stream, schema, &[1])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "Unexpected => field not found");
     }
 
     #[tokio::test]

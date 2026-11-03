@@ -2081,6 +2081,125 @@ message schema {
         assert_eq!(ids, vec![2, 3]);
     }
 
+    #[tokio::test]
+    async fn test_read_nested_equality_deletes_with_schema_evolution() {
+        use serde_json::json;
+
+        use crate::arrow::schema_to_arrow_schema;
+        use crate::scan::FileScanTaskDeleteFile;
+        use crate::spec::DataContentType;
+
+        let delete_schema: Schema = serde_json::from_value(json!({
+            "type": "struct", "schema-id": 0,
+            "fields": [{"id": 2, "name": "old_s", "required": false, "type": {
+                "type": "struct",
+                "fields": [{"id": 3, "name": "inner", "required": false, "type": {
+                    "type": "struct", "fields": [
+                        {"id": 4, "name": "old_key", "required": false, "type": "int"},
+                        {"id": 5, "name": "other", "required": false, "type": "int"},
+                    ],
+                }}],
+            }}],
+        }))
+        .unwrap();
+        let table_schema = Arc::new(
+            serde_json::from_value::<Schema>(json!({
+                "type": "struct", "schema-id": 0, "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "int"},
+                    {"id": 2, "name": "s", "required": false, "type": {
+                        "type": "struct", "fields": [
+                            {"id": 6, "name": "payload", "required": true, "type": "string"},
+                            {"id": 3, "name": "inner", "required": false, "type": {
+                                "type": "struct", "fields": [
+                                    {"id": 5, "name": "other", "required": false, "type": "int"},
+                                    {"id": 4, "name": "key", "required": false, "type": "long"},
+                                ],
+                            }},
+                        ],
+                    }},
+                ],
+            }))
+            .unwrap(),
+        );
+        let data_fields = schema_to_arrow_schema(&table_schema)
+            .unwrap()
+            .fields()
+            .to_vec();
+        let rows = json!([
+            {"id": 1, "s": {"payload": "a", "inner": {"other": 20, "key": 10}}},
+            {"id": 2, "s": {"payload": "b", "inner": {"other": 21, "key": 10}}},
+            {"id": 3, "s": {"payload": "c", "inner": {"other": 20, "key": 11}}},
+            {"id": 4, "s": null},
+        ]);
+        let data_batch = serde_arrow::to_record_batch(&data_fields, &rows).unwrap();
+        let expected = serde_arrow::to_record_batch(
+            &data_fields,
+            &json!([
+                {"id": 2, "s": {"payload": "b", "inner": {"other": 21, "key": 10}}},
+                {"id": 3, "s": {"payload": "c", "inner": {"other": 20, "key": 11}}},
+                {"id": 4, "s": null},
+            ]),
+        )
+        .unwrap();
+        let delete_fields = schema_to_arrow_schema(&delete_schema)
+            .unwrap()
+            .fields()
+            .to_vec();
+        let delete_batch = serde_arrow::to_record_batch(
+            &delete_fields,
+            &json!([
+                {"old_s": {"inner": {"old_key": 10, "other": 20}}},
+            ]),
+        )
+        .unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let data_path = tmp_dir.path().join("data.parquet");
+        let delete_path = tmp_dir.path().join("delete.parquet");
+        for (path, batch) in [(&data_path, &data_batch), (&delete_path, &delete_batch)] {
+            let mut writer =
+                ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
+            writer.write(batch).unwrap();
+            writer.close().unwrap();
+        }
+        let delete = FileScanTaskDeleteFile::builder()
+            .with_file_path(delete_path.to_str().unwrap().to_string())
+            .with_file_size_in_bytes(std::fs::metadata(&delete_path).unwrap().len())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![4, 5]))
+            .build()
+            .unwrap();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&data_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path.to_str().unwrap().to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_predicate(Some(
+                Reference::new("id")
+                    .greater_than(Datum::int(0))
+                    .bind(table_schema.clone(), true)
+                    .unwrap(),
+            ))
+            .with_schema(table_schema)
+            .with_project_field_ids(vec![1, 2])
+            .with_deletes(vec![delete])
+            .with_case_sensitive(true)
+            .build()
+            .unwrap();
+        let tasks: FileScanTaskStream = Box::pin(futures::stream::iter(vec![Ok(task)]));
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert_eq!(batches, vec![expected]);
+    }
+
     /// Reads a file written with an older nested schema through an evolved one. This relies
     /// on parquet-rs attaching `PARQUET:field_id` to struct children, list elements, and map
     /// keys and values, which the hand-built fixtures in `record_batch_transformer` assume.

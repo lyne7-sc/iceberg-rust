@@ -213,10 +213,9 @@ impl PredicateConverter<'_> {
     fn bound_reference(&mut self, reference: &BoundReference) -> Result<Option<usize>> {
         // The leaf column's index in Parquet schema.
         if let Some(column_idx) = self.column_map.get(&reference.field().id) {
-            if self.parquet_schema.get_column_root(*column_idx).is_group() {
+            if self.parquet_schema.column(*column_idx).max_rep_level() > 0 {
                 return Err(invalid_data!(
-                    "Leaf column `{}` in predicates isn't a root column in Parquet schema.",
-                    reference.field().name
+                    "Predicates on list or map elements are unsupported"
                 ));
             }
 

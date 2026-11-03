@@ -62,8 +62,18 @@ impl ArrowReader {
         // After collecting required leaf column indices used in the predicate,
         // creates the projection mask for the Arrow predicates.
         let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
-        let predicate_func = visit(&mut converter, predicates)?;
-        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
+        let has_nested_columns = column_indices
+            .iter()
+            .any(|idx| parquet_schema.get_column_root(*idx).is_group());
+        let mut predicate_func = visit(&mut converter, predicates)?;
+        let arrow_predicate = ArrowPredicateFn::new(projection_mask, move |batch| {
+            let batch = if has_nested_columns {
+                batch.normalize(".", None)?
+            } else {
+                batch
+            };
+            predicate_func(batch)
+        });
         Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
 
