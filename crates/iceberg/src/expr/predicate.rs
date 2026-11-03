@@ -383,16 +383,16 @@ impl Bind for Predicate {
                 })
             }
             Predicate::Unary(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
+                let bound_expr = expr.bind(schema.clone(), case_sensitive)?;
 
                 match &bound_expr.op {
                     &PredicateOperator::IsNull => {
-                        if bound_expr.term.field().required {
+                        if bound_expr.term.accessor().is_required(schema.as_struct()) {
                             return Ok(BoundPredicate::AlwaysFalse);
                         }
                     }
                     &PredicateOperator::NotNull => {
-                        if bound_expr.term.field().required {
+                        if bound_expr.term.accessor().is_required(schema.as_struct()) {
                             return Ok(BoundPredicate::AlwaysTrue);
                         }
                     }
@@ -1058,6 +1058,35 @@ mod tests {
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
         test_bound_predicate_serialize_diserialize(bound_expr);
+    }
+
+    #[test]
+    fn test_bind_required_child_null_predicates() {
+        for outer_required in [false, true] {
+            for inner_required in [false, true] {
+                let schema = Arc::new(
+                    serde_json::from_value::<Schema>(serde_json::json!({
+                        "type": "struct", "schema-id": 0,
+                        "fields": [{"id": 1, "name": "outer", "required": outer_required, "type": {
+                            "type": "struct",
+                            "fields": [{"id": 2, "name": "inner", "required": inner_required, "type": {
+                                "type": "struct",
+                                "fields": [{"id": 3, "name": "key", "required": true, "type": "int"}],
+                            }}],
+                        }}],
+                    })).unwrap(),
+                );
+                let reference = Reference::new("outer.inner.key");
+                let actual = [reference.clone().is_null(), reference.is_not_null()]
+                    .map(|predicate| predicate.bind(schema.clone(), true).unwrap().to_string());
+                let expected = if outer_required && inner_required {
+                    ["False", "True"]
+                } else {
+                    ["outer.inner.key IS NULL", "outer.inner.key IS NOT NULL"]
+                };
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]

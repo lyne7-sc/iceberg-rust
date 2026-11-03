@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use serde_derive::{Deserialize, Serialize};
 
-use crate::spec::{Datum, Literal, PrimitiveType, Struct};
+use crate::spec::{Datum, Literal, PrimitiveType, Struct, StructType, Type};
 use crate::{Error, ErrorKind, Result};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -54,6 +54,19 @@ impl StructAccessor {
 
     pub(crate) fn r#type(&self) -> &PrimitiveType {
         &self.r#type
+    }
+
+    /// Returns whether every field along the access path is required.
+    pub(crate) fn is_required(&self, struct_type: &StructType) -> bool {
+        let field = &struct_type.fields()[self.position];
+        if !field.required {
+            return false;
+        }
+        match (&self.inner, field.field_type.as_ref()) {
+            (None, _) => true,
+            (Some(inner), Type::Struct(child)) => inner.is_required(child),
+            _ => false,
+        }
     }
 
     pub(crate) fn get<'a>(&'a self, container: &'a Struct) -> Result<Option<Datum>> {
