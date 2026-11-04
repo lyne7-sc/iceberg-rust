@@ -413,6 +413,47 @@ mod test {
     }
 
     #[test]
+    fn test_strict_projection_truncate_unicode_prefix() -> Result<()> {
+        let transform = Transform::Truncate(3);
+        let fixture = TestProjectionFixture::new(
+            transform,
+            "name",
+            NestedField::required(1, "value", Primitive(StringType)),
+        );
+
+        for (value, starts_with, not_starts_with) in [
+            (
+                "北",
+                Some(r#"name STARTS WITH "北""#),
+                Some(r#"name NOT STARTS WITH "北""#),
+            ),
+            (
+                "Év",
+                Some(r#"name STARTS WITH "Év""#),
+                Some(r#"name NOT STARTS WITH "Év""#),
+            ),
+            ("Évr", Some(r#"name = "Évr""#), Some(r#"name != "Évr""#)),
+            ("Évry", None, Some(r#"name NOT STARTS WITH "Évr""#)),
+            (
+                "Pa",
+                Some(r#"name STARTS WITH "Pa""#),
+                Some(r#"name NOT STARTS WITH "Pa""#),
+            ),
+        ] {
+            for (op, expected) in [
+                (PredicateOperator::StartsWith, starts_with),
+                (PredicateOperator::NotStartsWith, not_starts_with),
+            ] {
+                let predicate = fixture.binary_predicate(op, Datum::string(value));
+                let result = transform.strict_project("name", &predicate)?;
+                assert_eq!(result.map(|p| p.to_string()).as_deref(), expected);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_projection_truncate_string() -> Result<()> {
         let value = "abcdefg";
 

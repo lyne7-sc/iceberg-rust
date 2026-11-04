@@ -2357,6 +2357,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scan_truncate_unicode_prefix() {
+        let mut fixture = TableTestFixture::new();
+        fs::create_dir_all(&fixture.table_location).unwrap();
+        let mut metadata = fixture.table.metadata().clone();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(metadata.current_schema_id())
+                .with_fields(vec![
+                    NestedField::required(1, "city", PrimitiveType::String).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_partition_field("city", "city_trunc", Transform::Truncate(3))
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        metadata.schemas.insert(schema.schema_id(), schema.clone());
+        metadata.default_partition_type = spec.partition_type(&schema).unwrap();
+        metadata
+            .partition_specs
+            .insert(spec.spec_id(), spec.clone());
+        metadata.default_spec = spec.clone();
+        fixture.table = fixture.table.with_metadata(Arc::new(metadata));
+
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let arrow_schema = Arc::new(crate::arrow::schema_to_arrow_schema(&schema).unwrap());
+        let mut manifest_writer = ManifestWriterBuilder::new(
+            fixture.next_manifest_file(),
+            Some(snapshot.snapshot_id()),
+            schema,
+            spec.as_ref().clone(),
+        )
+        .build_v2_data();
+        let cities = [
+            ("北京", "北京"),
+            ("Évry", "Évr"),
+            ("Évora", "Évo"),
+            ("Paris", "Par"),
+            ("Parma", "Par"),
+        ];
+        for (city, partition) in cities {
+            let path = format!("{}/{city}.parquet", fixture.table_location);
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                StringArray::from(vec![city]),
+            )])
+            .unwrap();
+            let mut writer =
+                ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema.clone(), None)
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            manifest_writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(spec.spec_id())
+                                .content(DataContentType::Data)
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(fs::metadata(&path).unwrap().len())
+                                .file_path(path)
+                                .record_count(1)
+                                .partition(Struct::from_iter([Some(Literal::string(partition))]))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .unwrap();
+        }
+        let manifest = manifest_writer.write_manifest_file().await.unwrap();
+        let output = fixture
+            .table
+            .file_io()
+            .new_output(snapshot.manifest_list())
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut list_writer = ManifestListWriter::v2(
+            output,
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
+        );
+        list_writer.add_manifests([manifest].into_iter()).unwrap();
+        list_writer.close().await.unwrap();
+
+        for (prefix, matching) in [
+            ("北", vec!["北京"]),
+            ("Év", vec!["Évora", "Évry"]),
+            ("Pa", vec!["Paris", "Parma"]),
+            ("Par", vec!["Paris", "Parma"]),
+            ("Paris", vec!["Paris"]),
+        ] {
+            let non_matching = cities
+                .iter()
+                .map(|(city, _)| *city)
+                .filter(|city| !matching.contains(city))
+                .collect::<Vec<_>>();
+            for (predicate, mut expected) in [
+                (
+                    Reference::new("city").starts_with(Datum::string(prefix)),
+                    matching,
+                ),
+                (
+                    Reference::new("city").not_starts_with(Datum::string(prefix)),
+                    non_matching,
+                ),
+            ] {
+                let scan = fixture.table.scan().with_filter(predicate).build().unwrap();
+                let batches: Vec<_> = scan.to_arrow().await.unwrap().try_collect().await.unwrap();
+                let mut actual: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_string::<i32>()
+                            .iter()
+                            .map(Option::unwrap)
+                    })
+                    .collect();
+                actual.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(actual, expected, "prefix: {prefix}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_filter_on_arrow_not_startswith() {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
